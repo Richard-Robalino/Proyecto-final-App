@@ -20,7 +20,7 @@ class EditRequestScreen extends ConsumerStatefulWidget {
   ConsumerState<EditRequestScreen> createState() => _EditRequestScreenState();
 }
 
-class _EditRequestScreenState extends ConsumerState<EditRequestScreen> {
+class _EditRequestScreenState extends ConsumerState<EditRequestScreen> with SingleTickerProviderStateMixin {
   static const _bucket = 'request_photos';
 
   final _titleCtrl = TextEditingController();
@@ -38,12 +38,20 @@ class _EditRequestScreenState extends ConsumerState<EditRequestScreen> {
 
   List<RequestPhoto> _existing = const [];
   final List<RequestPhoto> _toDelete = [];
-
   final List<XFile> _newPhotos = [];
+
+  // Animación de entrada
+  late AnimationController _animController;
+  late Animation<double> _fadeAnim;
 
   @override
   void initState() {
     super.initState();
+    _animController = AnimationController(vsync: this, duration: const Duration(milliseconds: 600));
+    _fadeAnim = CurvedAnimation(
+      parent: _animController,
+      curve: const Interval(0.0, 1.0, curve: Curves.easeOut),
+    );
     _load();
   }
 
@@ -52,6 +60,7 @@ class _EditRequestScreenState extends ConsumerState<EditRequestScreen> {
     _titleCtrl.dispose();
     _descCtrl.dispose();
     _addressCtrl.dispose();
+    _animController.dispose();
     super.dispose();
   }
 
@@ -76,6 +85,7 @@ class _EditRequestScreenState extends ConsumerState<EditRequestScreen> {
         _existing = photos;
         _loading = false;
       });
+      _animController.forward();
     } catch (e) {
       if (!mounted) return;
       setState(() => _loading = false);
@@ -85,6 +95,8 @@ class _EditRequestScreenState extends ConsumerState<EditRequestScreen> {
 
   bool get _canEditOrDelete {
     final st = _req?.status ?? '';
+    // Solo se puede editar si está solicitada (pending)
+    // Ajusta según tus estados ('requested' suele ser el inicial)
     return !{'on_the_way', 'in_progress', 'completed', 'rated'}.contains(st);
   }
 
@@ -107,24 +119,21 @@ class _EditRequestScreenState extends ConsumerState<EditRequestScreen> {
   }
 
   Future<void> _save() async {
-    if (!_canEditOrDelete) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No se puede editar: el servicio ya inició o terminó.')));
-      return;
-    }
+    if (!_canEditOrDelete) return;
 
     final repo = ref.read(supabaseRepoProvider);
     final catId = _catId;
     final picked = _picked;
 
     if (catId == null || picked == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Completa categoría y ubicación.')));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Faltan datos obligatorios.')));
       return;
     }
 
     setState(() => _saving = true);
 
     try {
-      // 1) actualizar solicitud
+      // 1. Actualizar datos
       await repo.updateRequest(
         requestId: widget.requestId,
         categoryId: catId,
@@ -135,12 +144,12 @@ class _EditRequestScreenState extends ConsumerState<EditRequestScreen> {
         address: _addressCtrl.text.trim().isEmpty ? null : _addressCtrl.text.trim(),
       );
 
-      // 2) borrar fotos marcadas
+      // 2. Borrar fotos
       for (final p in _toDelete) {
         await repo.deleteRequestPhoto(photoId: p.id, bucket: _bucket, path: p.path);
       }
 
-      // 3) subir nuevas fotos
+      // 3. Subir nuevas fotos
       const uuid = Uuid();
       for (final x in _newPhotos) {
         final bytes = await x.readAsBytes();
@@ -150,8 +159,8 @@ class _EditRequestScreenState extends ConsumerState<EditRequestScreen> {
       }
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Solicitud actualizada.')));
-      context.go('/client/request/${widget.requestId}');
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Cambios guardados con éxito')));
+      context.pop(); // Volver atrás
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error guardando: $e')));
@@ -161,19 +170,19 @@ class _EditRequestScreenState extends ConsumerState<EditRequestScreen> {
   }
 
   Future<void> _deleteRequest() async {
-    if (!_canEditOrDelete) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No se puede eliminar: el servicio ya inició o terminó.')));
-      return;
-    }
-
     final ok = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
-        title: const Text('Eliminar solicitud'),
-        content: const Text('¿Seguro? Esto eliminará la solicitud y sus fotos.'),
+        title: const Text('¿Eliminar solicitud?'),
+        content: const Text('Esta acción no se puede deshacer.'),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancelar')),
-          FilledButton.icon(onPressed: () => Navigator.pop(context, true), icon: const Icon(Icons.delete_outline), label: const Text('Eliminar')),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Eliminar'),
+          ),
         ],
       ),
     );
@@ -184,239 +193,366 @@ class _EditRequestScreenState extends ConsumerState<EditRequestScreen> {
     try {
       await repo.deleteRequest(widget.requestId);
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Solicitud eliminada.')));
-      context.go('/client');
+      context.go('/client'); // Volver al home
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('No se pudo eliminar: $e')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
     final req = _req;
 
+    if (_loading || req == null) {
+      return Scaffold(
+        backgroundColor: cs.surface,
+        appBar: AppBar(backgroundColor: cs.surface),
+        body: Center(child: CircularProgressIndicator(color: cs.primary)),
+      );
+    }
+
     return Scaffold(
+      backgroundColor: cs.surface,
       appBar: AppBar(
-        title: const Text('Editar solicitud'),
+        title: const Text('Editar Solicitud'),
+        backgroundColor: cs.surface,
+        surfaceTintColor: Colors.transparent,
+        centerTitle: true,
         actions: [
-          if (req != null)
+          if (_canEditOrDelete)
             IconButton(
-              onPressed: _canEditOrDelete ? _deleteRequest : null,
-              icon: const Icon(Icons.delete_outline),
+              tooltip: 'Eliminar solicitud',
+              onPressed: _deleteRequest,
+              icon: Icon(Icons.delete_outline_rounded, color: cs.error),
             ),
         ],
       ),
-      body: _loading
-          ? const Center(child: SizedBox(height: 28, width: 28, child: CircularProgressIndicator()))
-          : (req == null)
-              ? const Center(child: Text('No encontrada'))
-              : ListView(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-                  children: [
-                    DropdownButtonFormField<int>(
-                      value: _catId,
-                      items: _cats
-                          .map((c) => DropdownMenuItem<int>(
-                                value: c.id,
-                                child: Text(c.name),
-                              ))
-                          .toList(),
-                      onChanged: _canEditOrDelete ? (v) => setState(() => _catId = v) : null,
-                      decoration: const InputDecoration(labelText: 'Categoría'),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _titleCtrl,
-                      enabled: _canEditOrDelete,
-                      decoration: const InputDecoration(labelText: 'Título'),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _descCtrl,
-                      enabled: _canEditOrDelete,
-                      maxLines: 4,
-                      decoration: const InputDecoration(labelText: 'Descripción del problema'),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _addressCtrl,
-                      enabled: _canEditOrDelete,
-                      decoration: const InputDecoration(labelText: 'Dirección (opcional)'),
-                    ),
-                    const SizedBox(height: 12),
-
-                    // MAPA
-                    Card(
-                      child: Padding(
-                        padding: const EdgeInsets.all(14),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text('Ubicación (toca el mapa para mover pin)',
-                                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800)),
-                            const SizedBox(height: 8),
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(14),
-                              child: SizedBox(
-                                height: 240,
-                                child: FlutterMap(
-                                  options: MapOptions(
-                                    initialCenter: _picked ?? LatLng(req.lat, req.lng),
-                                    initialZoom: 15,
-                                    onTap: _canEditOrDelete
-                                        ? (tapPosition, point) => setState(() => _picked = point)
-                                        : null,
-                                    interactionOptions: const InteractionOptions(
-                                      flags: InteractiveFlag.drag |
-                                          InteractiveFlag.pinchZoom |
-                                          InteractiveFlag.doubleTapZoom |
-                                          InteractiveFlag.scrollWheelZoom,
-                                    ),
-                                  ),
-                                  children: [
-                                    TileLayer(
-                                      urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                                      userAgentPackageName: 'tecnigo_app',
-                                    ),
-                                    MarkerLayer(
-                                      markers: [
-                                        Marker(
-                                          point: _picked ?? LatLng(req.lat, req.lng),
-                                          width: 46,
-                                          height: 46,
-                                          child: const Icon(Icons.location_pin, size: 46),
-                                        ),
-                                      ],
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          ],
+      body: FadeTransition(
+        opacity: _fadeAnim,
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Aviso si no es editable
+              if (!_canEditOrDelete)
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  margin: const EdgeInsets.only(bottom: 20),
+                  decoration: BoxDecoration(
+                    color: Colors.amber.withOpacity(0.15),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.amber.withOpacity(0.5)),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.lock_clock_rounded, color: Colors.amber, size: 20),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'El servicio está en curso. No se pueden realizar cambios.',
+                          style: TextStyle(color: Colors.amber[900], fontSize: 13, fontWeight: FontWeight.bold),
                         ),
                       ),
-                    ),
+                    ],
+                  ),
+                ),
 
-                    const SizedBox(height: 12),
+              // 1. DETALLES
+              _SectionLabel(icon: Icons.article_rounded, label: 'Detalles del Servicio'),
+              const SizedBox(height: 10),
+              
+              // Categoría
+              Container(
+                decoration: BoxDecoration(
+                  color: cs.surfaceContainerHighest.withOpacity(0.3),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: DropdownButtonFormField<int>(
+                  value: _catId,
+                  decoration: const InputDecoration(
+                    labelText: 'Categoría',
+                    border: InputBorder.none,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  ),
+                  items: _cats.map((c) => DropdownMenuItem(value: c.id, child: Text(c.name))).toList(),
+                  onChanged: _canEditOrDelete ? (v) => setState(() => _catId = v) : null,
+                ),
+              ),
+              const SizedBox(height: 12),
+              
+              _StyledTextField(
+                controller: _titleCtrl,
+                label: 'Título breve (Ej. Fuga en lavabo)',
+                enabled: _canEditOrDelete,
+              ),
+              const SizedBox(height: 12),
+              _StyledTextField(
+                controller: _descCtrl,
+                label: 'Descripción detallada',
+                maxLines: 4,
+                enabled: _canEditOrDelete,
+              ),
 
-                    // FOTOS EXISTENTES
-                    Card(
-                      child: Padding(
-                        padding: const EdgeInsets.all(14),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Text('Fotos',
-                                    style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800)),
-                                const Spacer(),
-                                TextButton.icon(
-                                  onPressed: _canEditOrDelete ? _pickPhoto : null,
-                                  icon: const Icon(Icons.add_a_photo_outlined),
-                                  label: const Text('Agregar'),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 10),
+              const SizedBox(height: 24),
 
-                            if (_existing.isEmpty && _newPhotos.isEmpty)
-                              Text('No hay fotos.', style: Theme.of(context).textTheme.bodySmall),
-
-                            if (_existing.isNotEmpty)
-                              Wrap(
-                                spacing: 10,
-                                runSpacing: 10,
-                                children: _existing.map<Widget>((p) {
-                                  final url = ref.read(supabaseRepoProvider).publicUrl(_bucket, p.path);
-                                  final marked = _toDelete.any((x) => x.id == p.id);
-
-                                  return GestureDetector(
-                                    onTap: _canEditOrDelete ? () => _toggleDeleteExisting(p) : null,
-                                    child: Stack(
-                                      children: [
-                                        ClipRRect(
-                                          borderRadius: BorderRadius.circular(14),
-                                          child: SizedBox(
-                                            width: 98,
-                                            height: 98,
-                                            child: CachedNetworkImage(
-                                              imageUrl: url,
-                                              fit: BoxFit.cover,
-                                              placeholder: (_, __) => Container(color: Colors.black12),
-                                              errorWidget: (_, __, ___) => Container(
-                                                color: Colors.black12,
-                                                child: const Icon(Icons.broken_image_outlined),
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                        if (marked)
-                                          Positioned.fill(
-                                            child: Container(
-                                              decoration: BoxDecoration(
-                                                color: Colors.black.withOpacity(0.5),
-                                                borderRadius: BorderRadius.circular(14),
-                                              ),
-                                              child: const Center(
-                                                child: Icon(Icons.delete_forever, color: Colors.white, size: 34),
-                                              ),
-                                            ),
-                                          ),
-                                      ],
-                                    ),
-                                  );
-                                }).toList(),
-                              ),
-
-                            if (_newPhotos.isNotEmpty) ...[
-                              const SizedBox(height: 12),
-                              Text('Nuevas fotos', style: Theme.of(context).textTheme.labelLarge),
-                              const SizedBox(height: 8),
-                              Wrap(
-                                spacing: 10,
-                                runSpacing: 10,
-                                children: _newPhotos.map<Widget>((x) {
-                                  return Container(
-                                    width: 98,
-                                    height: 98,
-                                    decoration: BoxDecoration(
-                                      color: Colors.black12,
-                                      borderRadius: BorderRadius.circular(14),
-                                    ),
-                                    child: Center(
-                                      child: IconButton(
-                                        tooltip: 'Quitar',
-                                        onPressed: _canEditOrDelete
-                                            ? () => setState(() => _newPhotos.remove(x))
-                                            : null,
-                                        icon: const Icon(Icons.close),
-                                      ),
-                                    ),
-                                  );
-                                }).toList(),
+              // 2. UBICACIÓN
+              _SectionLabel(icon: Icons.location_on_rounded, label: 'Ubicación'),
+              const SizedBox(height: 10),
+              
+              _StyledTextField(
+                controller: _addressCtrl,
+                label: 'Referencia / Dirección',
+                enabled: _canEditOrDelete,
+                icon: Icons.directions_rounded,
+              ),
+              const SizedBox(height: 12),
+              
+              // Mapa
+              ClipRRect(
+                borderRadius: BorderRadius.circular(16),
+                child: SizedBox(
+                  height: 200,
+                  child: Stack(
+                    children: [
+                      FlutterMap(
+                        options: MapOptions(
+                          initialCenter: _picked ?? LatLng(req.lat, req.lng),
+                          initialZoom: 15,
+                          onTap: _canEditOrDelete 
+                            ? (_, p) => setState(() => _picked = p) 
+                            : null,
+                        ),
+                        children: [
+                          TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'),
+                          MarkerLayer(
+                            markers: [
+                              Marker(
+                                point: _picked ?? LatLng(req.lat, req.lng),
+                                width: 50,
+                                height: 50,
+                                child: const Icon(Icons.location_pin, size: 50, color: Colors.red),
                               ),
                             ],
-                          ],
+                          ),
+                        ],
+                      ),
+                      if (_canEditOrDelete)
+                        Positioned(
+                          bottom: 8,
+                          right: 8,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withOpacity(0.9),
+                              borderRadius: BorderRadius.circular(20),
+                              boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 4)],
+                            ),
+                            child: const Text(
+                              'Toca para mover',
+                              style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
-
-                    const SizedBox(height: 16),
-
-                    SizedBox(
-                      height: 50,
-                      child: FilledButton.icon(
-                        onPressed: _saving ? null : _save,
-                        icon: _saving
-                            ? const SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                            : const Icon(Icons.save_outlined),
-                        label: Text(_saving ? 'Guardando...' : 'Guardar cambios'),
-                      ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
+              ),
+
+              const SizedBox(height: 24),
+
+              // 3. FOTOS
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  _SectionLabel(icon: Icons.camera_alt_rounded, label: 'Fotos'),
+                  if (_canEditOrDelete)
+                    TextButton.icon(
+                      onPressed: _pickPhoto,
+                      icon: const Icon(Icons.add_circle_rounded),
+                      label: const Text('Agregar'),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 10),
+
+              if (_existing.isEmpty && _newPhotos.isEmpty)
+                Container(
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: cs.surfaceContainerHighest.withOpacity(0.3),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: cs.outlineVariant.withOpacity(0.5), style: BorderStyle.solid),
+                  ),
+                  child: Center(
+                    child: Text('Sin fotos adjuntas', style: TextStyle(color: cs.onSurfaceVariant)),
+                  ),
+                ),
+
+              Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  // Fotos Existentes
+                  ..._existing.map((p) {
+                    final isDeleted = _toDelete.any((x) => x.id == p.id);
+                    return GestureDetector(
+                      onTap: _canEditOrDelete ? () => _toggleDeleteExisting(p) : null,
+                      child: Stack(
+                        children: [
+                          Container(
+                            width: 100,
+                            height: 100,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(12),
+                              image: DecorationImage(
+                                image: CachedNetworkImageProvider(
+                                  ref.read(supabaseRepoProvider).publicUrl(_bucket, p.path),
+                                ),
+                                fit: BoxFit.cover,
+                                colorFilter: isDeleted 
+                                  ? const ColorFilter.mode(Colors.grey, BlendMode.saturation) 
+                                  : null,
+                              ),
+                            ),
+                          ),
+                          if (isDeleted)
+                            Positioned.fill(
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  color: Colors.black54,
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: const Center(
+                                  child: Icon(Icons.delete_forever_rounded, color: Colors.white, size: 32),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                  }),
+
+                  // Nuevas Fotos
+                  ..._newPhotos.map((x) {
+                    return Stack(
+                      children: [
+                        Container(
+                          width: 100,
+                          height: 100,
+                          decoration: BoxDecoration(
+                            color: cs.secondaryContainer,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: cs.secondary),
+                          ),
+                          child: const Center(child: Icon(Icons.image, color: Colors.white)),
+                        ),
+                        Positioned(
+                          top: 4,
+                          right: 4,
+                          child: InkWell(
+                            onTap: () => setState(() => _newPhotos.remove(x)),
+                            child: const CircleAvatar(
+                              radius: 12,
+                              backgroundColor: Colors.white,
+                              child: Icon(Icons.close, size: 16, color: Colors.black),
+                            ),
+                          ),
+                        )
+                      ],
+                    );
+                  }),
+                ],
+              ),
+
+              const SizedBox(height: 40),
+
+              // BOTÓN GUARDAR
+              if (_canEditOrDelete)
+                SizedBox(
+                  height: 54,
+                  child: FilledButton(
+                    onPressed: _saving ? null : _save,
+                    style: FilledButton.styleFrom(
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                      elevation: 4,
+                      shadowColor: cs.primary.withOpacity(0.4),
+                    ),
+                    child: _saving
+                        ? const CircularProgressIndicator(color: Colors.white)
+                        : const Text(
+                            'Guardar Cambios',
+                            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                          ),
+                  ),
+                ),
+                
+              const SizedBox(height: 20),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// --- WIDGETS AUXILIARES ---
+
+class _SectionLabel extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  const _SectionLabel({required this.icon, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Row(
+      children: [
+        Icon(icon, size: 18, color: cs.primary),
+        const SizedBox(width: 8),
+        Text(
+          label,
+          style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: cs.onSurface.withOpacity(0.8)),
+        ),
+      ],
+    );
+  }
+}
+
+class _StyledTextField extends StatelessWidget {
+  final TextEditingController controller;
+  final String label;
+  final bool enabled;
+  final int maxLines;
+  final IconData? icon;
+
+  const _StyledTextField({
+    required this.controller,
+    required this.label,
+    this.enabled = true,
+    this.maxLines = 1,
+    this.icon,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return TextFormField(
+      controller: controller,
+      enabled: enabled,
+      maxLines: maxLines,
+      decoration: InputDecoration(
+        labelText: label,
+        prefixIcon: icon != null ? Icon(icon, color: cs.outline) : null,
+        filled: true,
+        fillColor: enabled ? cs.surfaceContainerHighest.withOpacity(0.3) : cs.surfaceContainerHighest.withOpacity(0.1),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(16),
+          borderSide: BorderSide.none,
+        ),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      ),
     );
   }
 }

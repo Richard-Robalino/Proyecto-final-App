@@ -14,6 +14,9 @@ dependencies:
   # Backend
   supabase_flutter: ^2.8.0
 
+  cached_network_image: ^3.3.0
+  flutter_pdfview: ^1.3.2
+
   # State / routing
   flutter_riverpod: ^2.5.1
   go_router: ^14.2.0
@@ -28,18 +31,40 @@ dependencies:
   http: ^1.2.2
 
   # UI extras
-  cached_network_image: ^3.3.1
   image_picker: ^1.1.2
   intl: ^0.19.0
   flutter_rating_bar: ^4.0.1
   uuid: ^4.5.0
+  
+  # Audio
+  just_audio: ^0.9.36
 
 dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^4.0.0
+  flutter_launcher_icons: "^0.13.1"
+
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "assets/icons/app_icon.png"  # Ruta a tu ícono
+  adaptive_icon_background: "#FFFFFF"  # Color de fondo adaptativo
+  adaptive_icon_foreground: "assets/icons/app_icon.png"
 
 flutter:
   uses-material-design: true
+
+  # Declaración de assets
   assets:
     - assets/.env
+    - assets/animations/
+    - assets/sounds/
+    - assets/icons/
+    - assets/icons/app_icon.png
+
+# Configuración de iconos de la app
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icons/app_icon.png"
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/icons/app_icon.png"
+  min_sdk_android: 21

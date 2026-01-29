@@ -77,6 +77,32 @@ class SupabaseRepo {
     return ServiceRequest.fromMap((res as Map).cast<String, dynamic>());
   }
 
+// En lib/src/data/repositories/supabase_repo.dart
+
+  Future<bool> hasReviewed(String requestId) async {
+    final count = await supabase
+        .from('reviews')
+        .count(CountOption.exact)
+        .eq('request_id', requestId)
+        .eq('reviewer_id', userId);
+
+    return count > 0;
+  }
+
+  Stream<List<ServiceRequest>> streamMyRequests() {
+    return supabase
+        .from('service_requests')
+        .stream(primaryKey: ['id']) // Escucha cambios en esta tabla
+        .eq('client_id', userId) // Solo mis solicitudes
+        .map((data) {
+          // Convertimos los datos crudos a objetos
+          final requests = data.map((e) => ServiceRequest.fromMap(e)).toList();
+          // Ordenamos por fecha (las más nuevas arriba), ya que stream no siempre garantiza orden
+          requests.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+          return requests;
+        });
+  }
+
   Future<List<ServiceRequest>> fetchMyRequests() async {
     final res = await supabase
         .from('service_requests')
@@ -167,19 +193,26 @@ class SupabaseRepo {
     final req = await fetchRequestById(requestId);
     final st = (req.status).toString();
 
-    final canDelete = (st == 'requested' || st == 'quoted') && (req.acceptedQuoteId == null);
+    final canDelete =
+        (st == 'requested' || st == 'quoted') && (req.acceptedQuoteId == null);
     if (!canDelete) {
-      throw Exception('No se puede eliminar: el servicio ya fue iniciado o ya tiene cotización aceptada.');
+      throw Exception(
+          'No se puede eliminar: el servicio ya fue iniciado o ya tiene cotización aceptada.');
     }
 
     // borra fotos + storage
     final photos = await fetchRequestPhotos(requestId);
     for (final p in photos) {
-      await deleteRequestPhoto(photoId: p.id, bucket: requestPhotosBucket, path: p.path);
+      await deleteRequestPhoto(
+          photoId: p.id, bucket: requestPhotosBucket, path: p.path);
     }
 
     // borra solicitud (request_photos debería tener FK cascade o ya quedó limpio)
-    await supabase.from('service_requests').delete().eq('id', requestId).eq('client_id', userId);
+    await supabase
+        .from('service_requests')
+        .delete()
+        .eq('id', requestId)
+        .eq('client_id', userId);
   }
 
   // =========================
@@ -189,7 +222,9 @@ class SupabaseRepo {
     required String requestId,
     required String path,
   }) async {
-    await supabase.from('request_photos').insert({'request_id': requestId, 'path': path});
+    await supabase
+        .from('request_photos')
+        .insert({'request_id': requestId, 'path': path});
   }
 
   Future<List<RequestPhoto>> fetchRequestPhotos(String requestId) async {
@@ -303,148 +338,327 @@ class SupabaseRepo {
       'lng': lng,
     });
   }
+
   // =========================
   // ADMIN DASHBOARD COUNTS
   // =========================
-    // =========================
-  // ADMIN DASHBOARD COUNTS (COMPATIBLE)
-  // =========================
   Future<int> adminCountRequestsByStatus(String status) async {
-    final res = await supabase
-        .from('service_requests')
-        .select('id')
-        .eq('status', status);
-
-    return (res as List).length;
+    try {
+      final response = await supabase.rpc(
+        'admin_count_requests_by_status',
+        params: {'p_status': status},
+      );
+      return response as int;
+    } catch (e) {
+      throw Exception('Error contando solicitudes: $e');
+    }
   }
 
+
+
+  Future<List<Map<String, dynamic>>> getReviewsByRequestId(String requestId) async {
+    try {
+      final res = await supabase
+          .from('reviews')
+          .select('''
+            *,
+            reviewer:profiles!reviewer_id(full_name, role, avatar_path)
+          ''')
+          .eq('request_id', requestId);
+      
+      return List<Map<String, dynamic>>.from(res);
+    } catch (e) {
+      print('Error fetching reviews: $e');
+      return [];
+    }
+  }
+  
   Future<int> adminCountPendingTechVerifications() async {
-    // Ajusta el filtro según tu tabla real:
-    // - status = 'pending'  ó
-    // - verified = false
-    final res = await supabase
-        .from('technician_certifications')
-        .select('id')
-        .or('status.eq.pending,verified.eq.false');
-
-    return (res as List).length;
+    try {
+      final response = await supabase.rpc('admin_count_pending_verifications');
+      return response as int;
+    } catch (e) {
+      throw Exception('Error contando verificaciones: $e');
+    }
   }
 
-    // =========================
-  // TECH PUBLIC PROFILE / REVIEWS / PORTFOLIO
+  Future<List<Map<String, dynamic>>> adminGetRequestsByStatus(
+      String status) async {
+    try {
+      // 1. TRADUCCIÓN: UI -> Base de Datos
+      // Si en tu UI usas "En Progreso", aquí lo convertimos a "in_progress"
+      String dbStatus = status;
+      switch (status) {
+        case 'Solicitadas':
+          dbStatus = 'requested';
+          break;
+        case 'Aceptadas':
+          dbStatus = 'accepted';
+          break;
+        case 'En Progreso':
+          dbStatus = 'in_progress';
+          break;
+        case 'Completadas':
+          dbStatus = 'completed';
+          break;
+        // Si ya viene en inglés o minúsculas, lo dejamos igual
+        default:
+          dbStatus = status.toLowerCase();
+      }
+
+      print('🔍 Consultando DB con estado: $dbStatus');
+
+      final response = await supabase.rpc(
+        'admin_get_requests_by_status',
+        params: {'p_status': dbStatus},
+      );
+
+      // 2. BLINDAJE: Verificamos si es lista, nulo o mapa
+      if (response == null) return [];
+
+      if (response is List) {
+        return List<Map<String, dynamic>>.from(response);
+      } else {
+        print('⚠️ Formato inesperado en adminGetRequestsByStatus: $response');
+        return [];
+      }
+    } catch (e) {
+      print('❌ ERROR en adminGetRequestsByStatus: $e');
+      return []; // Retornamos lista vacía en vez de explotar
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> adminGetPendingTechVerifications() async {
+    try {
+      final response = await supabase.rpc('admin_get_pending_verifications');
+
+      if (response == null) return [];
+
+      // Si es una lista normal, perfecto
+      if (response is List) {
+        return List<Map<String, dynamic>>.from(response);
+      }
+
+      // Si no es lista, retornamos vacío (ya no intentamos convertir Map)
+      print('⚠️ Formato desconocido en Verificaciones: $response');
+      return [];
+    } catch (e) {
+      print('❌ Error obteniendo verificaciones: $e');
+      return [];
+    }
+  }
+
+  Future<void> adminVerifyTechnician(String userId, bool approve) async {
+    try {
+      await supabase.rpc(
+        'admin_verify_technician',
+        params: {
+          'p_user_id': userId,
+          'p_approve': approve,
+        },
+      );
+    } catch (e) {
+      throw Exception('Error verificando técnico: $e');
+    }
+  }
+
   // =========================
-  Future<Map<String, dynamic>> fetchTechnicianPublicProfile(String techId) async {
-    final p = await supabase
-        .from('profiles')
-        .select('id, full_name, avatar_path')
-        .eq('id', techId)
-        .single();
+  // ADMIN CATEGORIES
+  // =========================
+  Future<String> uploadCategoryIcon({required Uint8List bytes, required String ext}) async {
+    final filename = 'cat_${DateTime.now().millisecondsSinceEpoch}.$ext';
+    
+    // CORRECCIÓN 1: Como ya vamos a entrar al bucket 'categories', 
+    // no hace falta poner la carpeta 'categories/' en el nombre del archivo.
+    // Solo usamos el nombre del archivo.
+    final path = filename; 
 
-    final tp = await supabase
-        .from('technician_profiles')
-        .select('bio, base_rate, coverage_radius_km, verification_status, verified_at')
-        .eq('id', techId)
-        .maybeSingle();
+    // CORRECCIÓN 2: Cambiamos 'public' por 'categories' (el nombre real de tu bucket)
+    await supabase.storage.from('categories').uploadBinary(
+          path,
+          bytes,
+          fileOptions: FileOptions(contentType: 'image/$ext', upsert: true),
+        );
 
+    return path;
+  }
+
+  String categoryIconUrl(String path) {
+    // Si por alguna razón el path ya es una URL completa, la devolvemos
+    if (path.startsWith('http')) return path;
+
+    // CORRECCIÓN 3: Leemos del bucket 'categories', no de 'public'
+    return supabase.storage.from('categories').getPublicUrl(path);
+  }
+
+  Future<void> adminUpsertCategory({
+    int? id,
+    required String name,
+    String? icon,
+  }) async {
+    if (id == null) {
+      // Insert
+      await supabase.from('service_categories').insert({
+        'name': name,
+        'icon': icon,
+      });
+    } else {
+      // Update
+      await supabase.from('service_categories').update({
+        'name': name,
+        'icon': icon,
+      }).eq('id', id);
+    }
+  }
+
+
+  Future<String> getCurrentTechnicianStatus() async {
+    try {
+      final res = await supabase
+          .from('technician_profiles')
+          .select('verification_status')
+          .eq('id', userId)
+          .maybeSingle();
+      
+      if (res == null) return 'pending'; // Si no existe perfil, asumimos pendiente
+      return res['verification_status'] as String;
+    } catch (e) {
+      print('Error fetching tech status: $e');
+      return 'pending'; // Ante cualquier error, bloqueamos por seguridad
+    }
+  }
+  Future<void> adminDeleteCategory(int id) async {
+    await supabase.from('service_categories').delete().eq('id', id);
+  }
+
+  // =========================
+  // TECHNICIAN PROFILE (PUBLIC)
+  // =========================
+  Future<Map<String, dynamic>?> fetchTechnicianPublicProfile(
+      String techId) async {
+    final res = await supabase.from('profiles').select('''
+          id, full_name, avatar_path,
+          technician_profiles!inner(bio, base_rate, coverage_radius_km)
+        ''').eq('id', techId).eq('role', 'technician').maybeSingle();
+
+    if (res == null) return null;
+
+    final profile = Map<String, dynamic>.from(res);
+    final techData = profile['technician_profiles'] as Map?;
+
+    if (techData != null) {
+      profile['bio'] = techData['bio'];
+      profile['base_rate'] = techData['base_rate'];
+      profile['coverage_radius_km'] = techData['coverage_radius_km'];
+    }
+
+    profile.remove('technician_profiles');
+
+    // Obtener métricas
     final metrics = await supabase
         .from('technician_metrics')
         .select('avg_rating, total_reviews, completed_jobs')
         .eq('technician_id', techId)
         .maybeSingle();
 
-    return {
-      ...(p as Map).cast<String, dynamic>(),
-      ...((tp as Map?)?.cast<String, dynamic>() ?? {}),
-      ...((metrics as Map?)?.cast<String, dynamic>() ?? {}),
-    };
+    if (metrics != null) {
+      profile['avg_rating'] = metrics['avg_rating'] ?? 0;
+      profile['total_reviews'] = metrics['total_reviews'] ?? 0;
+      profile['completed_jobs'] = metrics['completed_jobs'] ?? 0;
+    }
+
+    return profile;
   }
 
-  Future<List<ServiceCategory>> fetchTechnicianSpecialties(String techId) async {
+  Future<List<ServiceCategory>> fetchTechnicianSpecialties(
+      String techId) async {
     final res = await supabase
         .from('technician_specialties')
-        .select('category:service_categories(id, name, icon)')
+        .select('service_categories!inner(id, name, icon)')
         .eq('technician_id', techId);
 
-    final list = (res as List).cast<Map<String, dynamic>>();
-    return list
-        .map((row) => (row['category'] as Map).cast<String, dynamic>())
-        .map(ServiceCategory.fromMap)
-        .toList();
+    return (res as List).map((item) {
+      final cat = item['service_categories'];
+      return ServiceCategory.fromMap(Map<String, dynamic>.from(cat));
+    }).toList();
   }
 
-  Future<List<Map<String, dynamic>>> fetchTechnicianReviews(String techId) async {
-    final res = await supabase
-        .from('reviews')
-        .select('id, rating, comment, created_at, reviewer:profiles!reviews_reviewer_id_fkey(id, full_name, avatar_path)')
-        .eq('reviewee_id', techId)
-        .order('created_at', ascending: false);
+  Future<List<Map<String, dynamic>>> fetchTechnicianReviews(
+      String techId) async {
+    try {
+      final res = await supabase.from('reviews').select('''
+            id, rating, comment, created_at,
+            reviewer:profiles!reviews_reviewer_id_fkey(full_name, avatar_path)
+          ''').eq('reviewee_id', techId).order('created_at', ascending: false);
 
-    return (res as List).cast<Map<String, dynamic>>();
+      if (res == null) return [];
+
+      // Seguridad extra por si Supabase cambia el tipo de retorno
+      if (res is List) {
+        return List<Map<String, dynamic>>.from(res);
+      }
+      return [];
+    } catch (e) {
+      print('Error en fetchTechnicianReviews: $e');
+      return [];
+    }
   }
+  Future<List<Map<String, dynamic>>> getAdminUsers(String roleFilter) async {
+    try {
+      // Usamos la vista que creamos en SQL
+      var query = supabase.from('admin_users_view').select();
 
-  Future<List<Map<String, dynamic>>> fetchTechnicianPortfolio(String techId) async {
-    final res = await supabase
-        .from('portfolio_items')
-        .select('id, title, description, created_at, photos:portfolio_photos(id, path, created_at)')
-        .eq('technician_id', techId)
-        .order('created_at', ascending: false);
+      if (roleFilter == 'technician') {
+        query = query.eq('role', 'technician');
+      } else if (roleFilter == 'client') {
+        query = query.eq('role', 'client');
+      }
 
-    return (res as List).cast<Map<String, dynamic>>();
-  }
+      final response = await query;
 
-
-
-  // =========================
-  // ADMIN CATEGORIES CRUD
-  // =========================
-  Future<void> adminUpsertCategory({
-    int? id,
-    required String name,
-    String? icon, // aquí guardaremos el path de storage o emoji si quieres
-  }) async {
-    final data = <String, dynamic>{
-      'name': name,
-      'icon': icon,
-    };
-
-    if (id == null) {
-      await supabase.from('service_categories').insert(data);
-    } else {
-      await supabase.from('service_categories').update(data).eq('id', id);
+      if (response == null) return [];
+      
+      if (response is List) {
+        return List<Map<String, dynamic>>.from(response);
+      }
+      
+      return [];
+    } catch (e) {
+      print('❌ Error cargando usuarios ($roleFilter): $e');
+      return [];
     }
   }
 
-  Future<void> adminDeleteCategory(int id) async {
-    await supabase.from('service_categories').delete().eq('id', id);
+  Future<List<Map<String, dynamic>>> fetchTechnicianPortfolio(
+      String techId) async {
+    final res = await supabase.from('portfolio_items').select('''
+          id, title, description, created_at,
+          portfolio_photos(id, path)
+        ''').eq('technician_id', techId).order('created_at', ascending: false);
+
+    return (res as List).map((item) {
+      final portfolio = Map<String, dynamic>.from(item);
+      portfolio['photos'] = portfolio['portfolio_photos'] ?? [];
+      portfolio.remove('portfolio_photos');
+      return portfolio;
+    }).toList();
   }
 
-  Future<String> uploadCategoryIcon({
-    required Uint8List bytes,
-    required String ext, // "png" o "jpg"
-  }) async {
-    final safeExt = ext.toLowerCase().replaceAll('.', '');
-    final fileName = 'cat_${DateTime.now().millisecondsSinceEpoch}.$safeExt';
-    final path = 'icons/$fileName';
+  // En SupabaseRepo...
 
-    final contentType = safeExt == 'png' ? 'image/png' : 'image/jpeg';
-
-    // sube al bucket category_icons
-    await supabase.storage.from('category_icons').uploadBinary(
-          path,
-          bytes,
-          fileOptions: FileOptions(contentType: contentType, upsert: true),
-        );
-
-    // guardamos SOLO el path dentro del bucket
-    return path;
-  }
-
-  String categoryIconUrl(String path) {
-    return supabase.storage.from('category_icons').getPublicUrl(path);
+  Future<void> adminToggleUserStatus(String userId, bool isActive) async {
+    try {
+      await supabase.from('profiles').update({
+        'is_active': isActive,
+        'updated_at': DateTime.now().toIso8601String(),
+      }).eq('id', userId);
+    } catch (e) {
+      throw Exception('Error actualizando estado del usuario: $e');
+    }
   }
 
   // =========================
-  // IA DIAGNOSE (NO CAMBIO AQUÍ)
+  // IA DIAGNOSE
   // =========================
   Future<AiDiagnoseResult> aiDiagnose({
     required String title,
@@ -455,8 +669,7 @@ class SupabaseRepo {
     if (user == null) {
       return AiDiagnoseResult.fromMap({
         'ok': true,
-        'summary':
-            'No hay sesión activa. Inicia sesión para usar la IA.',
+        'summary': 'No hay sesión activa. Inicia sesión para usar la IA.',
         'confidence': 0.4,
         'actions': ['Inicia sesión', 'Vuelve a intentar'],
       });
@@ -465,7 +678,8 @@ class SupabaseRepo {
     final payload = {
       'title': title,
       'description': description,
-      'categories': categories.map((c) => {'id': c.id, 'name': c.name}).toList(),
+      'categories':
+          categories.map((c) => {'id': c.id, 'name': c.name}).toList(),
       'locale': 'es',
     };
 
@@ -474,3 +688,4 @@ class SupabaseRepo {
     return AiDiagnoseResult.fromMap(data);
   }
 }
+

@@ -915,6 +915,237 @@ with check (
   )
 );
 
--- =========================================================
--- FIN SCHEMA
--- =========================================================
+-- 10) FUNCIONES ADMIN
+
+-- 10.1 Contar solicitudes por estado
+create or replace function public.admin_count_requests_by_status(p_status text)
+returns int
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select count(*)::int
+  from public.service_requests
+  where status = p_status::public.request_status;
+$$;
+
+-- 10.2 Contar técnicos pendientes de verificación
+create or replace function public.admin_count_pending_verifications()
+returns int
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select count(*)::int
+  from public.technician_profiles
+  where verification_status = 'pending';
+$$;
+
+-- 10.3 Obtener solicitudes por estado con detalles (CORREGIDO)
+create or replace function public.admin_get_requests_by_status(p_status text)
+returns table (
+  id uuid,
+  service_type text,
+  description text,
+  status text,
+  created_at timestamptz,
+  user_id uuid,
+  technician_id uuid,
+  client_name text,
+  client_email text,
+  technician_name text,
+  technician_email text
+)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select
+    sr.id,
+    sc.name as service_type,
+    sr.description,
+    sr.status::text,
+    sr.created_at,
+    sr.client_id as user_id,
+    q.technician_id,
+    pc.full_name as client_name,
+    auc.email as client_email,
+    pt.full_name as technician_name,
+    aut.email as technician_email
+  from public.service_requests sr
+  join public.service_categories sc on sc.id = sr.category_id
+  join public.profiles pc on pc.id = sr.client_id
+  left join auth.users auc on auc.id = sr.client_id
+  left join public.quotes q on q.id = sr.accepted_quote_id
+  left join public.profiles pt on pt.id = q.technician_id
+  left join auth.users aut on aut.id = q.technician_id
+  where sr.status = p_status::public.request_status
+  order by sr.created_at desc;
+$$;
+
+-- 10.4 Obtener técnicos pendientes de verificación
+create or replace function public.admin_get_pending_verifications()
+returns table (
+  user_id uuid,
+  full_name text,
+  email text,
+  phone text,
+  role text,
+  is_verified boolean,
+  experience_years int,
+  specialties text[]
+)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select
+    p.id as user_id,
+    p.full_name,
+    au.email,
+    pp.phone,
+    p.role::text,
+    false as is_verified,
+    0 as experience_years,
+    array(
+      select sc.name
+      from public.technician_specialties ts
+      join public.service_categories sc on sc.id = ts.category_id
+      where ts.technician_id = p.id
+    ) as specialties
+  from public.profiles p
+  join auth.users au on au.id = p.id
+  left join public.profile_private pp on pp.id = p.id
+  join public.technician_profiles tp on tp.id = p.id
+  where p.role = 'technician'
+    and tp.verification_status = 'pending'
+  order by p.created_at asc;
+$$;
+
+-- 10.5 Aprobar o rechazar técnico
+create or replace function public.admin_verify_technician(
+  p_user_id uuid,
+  p_approve boolean
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  -- Verificar que el usuario actual sea admin
+  if not exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'admin'
+  ) then
+    raise exception 'Unauthorized: Only admins can verify technicians';
+  end if;
+
+  if p_approve then
+    -- Aprobar
+    update public.technician_profiles
+    set verification_status = 'approved',
+        verified_at = now()
+    where id = p_user_id;
+  else
+    -- Rechazar (marcar como rejected o eliminar)
+    update public.technician_profiles
+    set verification_status = 'rejected'
+    where id = p_user_id;
+    
+    -- Opcional: eliminar usuario completamente
+    -- delete from auth.users where id = p_user_id;
+  end if;
+end;
+$$;
+
+-- 10.6 Vista consolidada de usuarios (para admin)
+create or replace view public.admin_users_view as
+select
+  p.id,
+  p.role::text,
+  p.full_name,
+  au.email,
+  pp.phone,
+  p.created_at,
+  p.is_active,
+  case
+    when p.role = 'technician' then tp.verification_status::text
+    else null
+  end as verification_status,
+  case
+    when p.role = 'technician' then (
+      select count(*)::int
+      from public.service_requests sr
+      join public.quotes q on q.id = sr.accepted_quote_id
+      where q.technician_id = p.id
+        and sr.status in ('completed', 'rated')
+    )
+    else 0
+  end as completed_jobs,
+  case
+    when p.role = 'technician' then (
+      select avg(r.rating)::numeric(3,2)
+      from public.reviews r
+      where r.reviewee_id = p.id
+    )
+    else null
+  end as avg_rating
+from public.profiles p
+join auth.users au on au.id = p.id
+left join public.profile_private pp on pp.id = p.id
+left join public.technician_profiles tp on tp.id = p.id;
+
+-- 11) RLS PARA FUNCIONES ADMIN
+-- Las funciones con security definer ya incluyen verificación de permisos internamente
+
+-- Permitir a los admins ver todo
+drop policy if exists "admin_full_access_profiles" on public.profiles;
+create policy "admin_full_access_profiles"
+on public.profiles for all
+to authenticated
+using (
+  exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'admin'
+  )
+);
+
+drop policy if exists "admin_full_access_requests" on public.service_requests;
+create policy "admin_full_access_requests"
+on public.service_requests for select
+to authenticated
+using (
+  exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'admin'
+  )
+);
+
+drop policy if exists "admin_full_access_quotes" on public.quotes;
+create policy "admin_full_access_quotes"
+on public.quotes for select
+to authenticated
+using (
+  exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'admin'
+  )
+);
+
+drop policy if exists "admin_full_access_tech_profiles" on public.technician_profiles;
+create policy "admin_full_access_tech_profiles"
+on public.technician_profiles for all
+to authenticated
+using (
+  exists (
+    select 1 from public.profiles
+    where id = auth.uid() and role = 'admin'
+  )
+);
+
+-- ...existing code...

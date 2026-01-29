@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:intl/intl.dart';
 import 'package:latlong2/latlong.dart';
 
 import '../../data/models/models.dart';
@@ -13,16 +14,17 @@ class RequestDetailsScreen extends ConsumerStatefulWidget {
   final String requestId;
 
   @override
-  ConsumerState<RequestDetailsScreen> createState() =>
-      _RequestDetailsScreenState();
+  ConsumerState<RequestDetailsScreen> createState() => _RequestDetailsScreenState();
 }
 
 class _RequestDetailsScreenState extends ConsumerState<RequestDetailsScreen> {
   bool _loading = true;
   ServiceRequest? _request;
   List<RequestPhoto> _photos = const [];
-
   static const _bucket = 'request_photos';
+
+  // Para saber si ya calificó
+  bool _hasReviewed = false;
 
   @override
   void initState() {
@@ -34,53 +36,53 @@ class _RequestDetailsScreenState extends ConsumerState<RequestDetailsScreen> {
     setState(() => _loading = true);
     try {
       final repo = ref.read(supabaseRepoProvider);
-      final req = await repo.fetchRequestById(widget.requestId);
-      final photos = await repo.fetchRequestPhotos(widget.requestId);
+      
+      // Carga paralela: Request, Fotos, y si ya hizo review
+      final results = await Future.wait([
+        repo.fetchRequestById(widget.requestId),
+        repo.fetchRequestPhotos(widget.requestId),
+        repo.hasReviewed(widget.requestId),
+      ]);
+      
       if (!mounted) return;
       setState(() {
-        _request = req;
-        _photos = photos;
+        _request = results[0] as ServiceRequest;
+        _photos = results[1] as List<RequestPhoto>;
+        _hasReviewed = results[2] as bool;
+        _loading = false;
       });
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('Error: $e')));
-    } finally {
-      if (mounted) setState(() => _loading = false);
+      setState(() => _loading = false);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
     }
   }
 
+  // Solo se puede borrar si no ha sido aceptada ni iniciada
   bool get _canDelete {
     final s = _request?.status ?? '';
-    return s == 'requested' || s == 'quoted';
+    return (s == 'requested' || s == 'quoted') && _request?.acceptedQuoteId == null;
   }
 
+  // Solo se puede calificar si está completado y NO ha calificado aún
   bool get _canReview {
     final s = _request?.status ?? '';
-    return s == 'completed';
+    return (s == 'completed' || s == 'rated') && !_hasReviewed;
   }
 
   Future<void> _confirmDelete() async {
-    if (!_canDelete) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text('No se puede eliminar: el trabajo ya inició.')),
-      );
-      return;
-    }
-
     final ok = await showDialog<bool>(
       context: context,
       builder: (c) => AlertDialog(
-        title: const Text('Eliminar solicitud'),
-        content: const Text('¿Seguro? Esta acción no se puede deshacer.'),
+        title: const Text('¿Eliminar solicitud?'),
+        content: const Text('Se borrará permanentemente y cancelará las cotizaciones.'),
         actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(c, false),
-              child: const Text('Cancelar')),
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancelar')),
           FilledButton(
-              onPressed: () => Navigator.pop(c, true),
-              child: const Text('Eliminar')),
+            onPressed: () => Navigator.pop(c, true),
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Eliminar'),
+          ),
         ],
       ),
     );
@@ -91,662 +93,473 @@ class _RequestDetailsScreenState extends ConsumerState<RequestDetailsScreen> {
       final repo = ref.read(supabaseRepoProvider);
       await repo.deleteRequest(widget.requestId);
       if (!mounted) return;
-      context.pop();
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Solicitud eliminada.')));
+      context.pop(); 
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('No se pudo eliminar: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
     }
   }
 
-  String _statusLabel(String s) {
-    switch (s) {
-      case 'requested':
-        return 'Solicitada';
-      case 'quoted':
-        return 'Cotización';
-      case 'accepted':
-        return 'Aceptada';
-      case 'on_the_way':
-        return 'En camino';
-      case 'in_progress':
-        return 'En progreso';
-      case 'completed':
-        return 'Completada';
-      case 'cancelled':
-        return 'Cancelada';
-      default:
-        return s;
-    }
-  }
-
-  Color _statusColor(BuildContext context, String s) {
+  @override
+  Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    switch (s) {
-      case 'requested':
-        return cs.secondaryContainer;
-      case 'quoted':
-        return cs.tertiaryContainer;
-      case 'accepted':
-        return cs.primaryContainer;
-      case 'on_the_way':
-        return cs.secondaryContainer;
-      case 'in_progress':
-        return cs.primaryContainer;
-      case 'completed':
-        return Colors.green.withOpacity(0.15);
-      case 'cancelled':
-        return Colors.red.withOpacity(0.12);
-      default:
-        return cs.surfaceContainerHighest;
-    }
-  }
+    final req = _request;
 
-  Future<void> _openPhoto(String url) async {
-    await showDialog(
-      context: context,
-      builder: (_) => Dialog(
-        insetPadding: const EdgeInsets.all(12),
-        child: InteractiveViewer(
-          child: CachedNetworkImage(imageUrl: url, fit: BoxFit.contain),
+    if (_loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    if (req == null) return const Scaffold(body: Center(child: Text('Solicitud no encontrada')));
+
+    return Scaffold(
+      backgroundColor: cs.surface,
+      appBar: AppBar(
+        title: const Text('Detalle de Servicio'),
+        centerTitle: true,
+        backgroundColor: cs.surface,
+        surfaceTintColor: Colors.transparent,
+        actions: [
+          IconButton(onPressed: _loadAll, icon: const Icon(Icons.refresh_rounded)),
+          if (_canDelete)
+            PopupMenuButton(
+              itemBuilder: (context) => [
+                PopupMenuItem(
+                  onTap: () => context.push('/client/request/${req.id}/edit'),
+                  child: const Row(children: [Icon(Icons.edit, size: 20), SizedBox(width: 8), Text('Editar')]),
+                ),
+                PopupMenuItem(
+                  onTap: _confirmDelete,
+                  child: const Row(children: [Icon(Icons.delete, color: Colors.red, size: 20), SizedBox(width: 8), Text('Eliminar', style: TextStyle(color: Colors.red))]),
+                ),
+              ],
+            ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: _loadAll,
+        child: ListView(
+          padding: const EdgeInsets.all(20),
+          children: [
+            // 1. ESTADO
+            Center(child: _StatusBadgeLarge(status: req.status)),
+            const SizedBox(height: 20),
+
+            // 2. INFO PRINCIPAL
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, 4))],
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(req.title, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  Text(req.description, style: TextStyle(fontSize: 15, color: cs.onSurface.withOpacity(0.8))),
+                  
+                  const Divider(height: 24),
+
+                  // FOTOS
+                  if (_photos.isNotEmpty) ...[
+                    const Text('Fotos adjuntas', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      height: 80,
+                      child: ListView.separated(
+                        scrollDirection: Axis.horizontal,
+                        itemCount: _photos.length,
+                        separatorBuilder: (_, __) => const SizedBox(width: 8),
+                        itemBuilder: (ctx, i) {
+                          final url = ref.read(supabaseRepoProvider).publicUrl(_bucket, _photos[i].path);
+                          return GestureDetector(
+                            onTap: () => _showPhotoDialog(context, url),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(12),
+                              child: CachedNetworkImage(
+                                imageUrl: url, 
+                                width: 80, height: 80, 
+                                fit: BoxFit.cover,
+                                placeholder: (_,__) => Container(color: Colors.grey[200]),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                  ],
+
+                  // UBICACIÓN
+                  if (req.address != null)
+                    Row(
+                      children: [
+                        Icon(Icons.location_on, size: 16, color: cs.primary),
+                        const SizedBox(width: 4),
+                        Expanded(child: Text(req.address!, style: const TextStyle(fontSize: 13, color: Colors.grey))),
+                      ],
+                    ),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 24),
+
+            // 3. COTIZACIONES (LO MÁS IMPORTANTE PARA EL CLIENTE)
+            _QuotesList(
+              requestId: req.id,
+              acceptedQuoteId: req.acceptedQuoteId,
+              onQuoteAccepted: _loadAll, // Recargar al aceptar
+            ),
+
+            const SizedBox(height: 24),
+
+            // 4. HISTORIAL
+            const Text('Seguimiento', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            const SizedBox(height: 12),
+            _TimelineSection(requestId: req.id),
+
+            const SizedBox(height: 40),
+
+            // 5. BOTÓN CALIFICAR (Si aplica)
+            if (_canReview)
+              SizedBox(
+                width: double.infinity,
+                height: 54,
+                child: FilledButton.icon(
+                  onPressed: () async {
+                    await context.push('/client/request/${req.id}/review');
+                    _loadAll();
+                  },
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Colors.amber[700],
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                  ),
+                  icon: const Icon(Icons.star_rounded),
+                  label: const Text('CALIFICAR TÉCNICO', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+              ),
+            
+            // Si ya calificó
+            if (req.status == 'rated' && _hasReviewed)
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(color: Colors.green[50], borderRadius: BorderRadius.circular(12)),
+                child: const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.check_circle, color: Colors.green),
+                    SizedBox(width: 8),
+                    Text('¡Servicio finalizado y calificado!', style: TextStyle(color: Colors.green, fontWeight: FontWeight.bold)),
+                  ],
+                ),
+              ),
+
+            const SizedBox(height: 40),
+          ],
         ),
       ),
     );
   }
 
-  void _openQuotesBottomSheet(ServiceRequest req) {
-    final repo = ref.read(supabaseRepoProvider);
-
-    showModalBottomSheet(
+  void _showPhotoDialog(BuildContext context, String url) {
+    showDialog(
       context: context,
-      showDragHandle: true,
-      isScrollControlled: true,
-      builder: (ctx) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-            child: StreamBuilder<List<Quote>>(
-              stream: repo.streamQuotes(widget.requestId),
-              builder: (context, snap) {
-                final quotes = snap.data ?? const <Quote>[];
-                if (snap.connectionState == ConnectionState.waiting) {
-                  return const SizedBox(
-                    height: 240,
-                    child: Center(child: CircularProgressIndicator()),
-                  );
-                }
-                if (quotes.isEmpty) {
-                  return const SizedBox(
-                    height: 220,
-                    child: Center(child: Text('Aún no hay cotizaciones.')),
-                  );
-                }
+      builder: (_) => Dialog(
+        backgroundColor: Colors.transparent,
+        child: InteractiveViewer(child: CachedNetworkImage(imageUrl: url)),
+      ),
+    );
+  }
+}
 
-                final acceptedId = req.acceptedQuoteId;
+// --- COMPONENTES ---
 
-                return ConstrainedBox(
-                  constraints: BoxConstraints(
-                    maxHeight: MediaQuery.of(context).size.height * 0.75,
-                  ),
-                  child: ListView.separated(
-                    itemCount: quotes.length,
-                    separatorBuilder: (_, __) => const SizedBox(height: 10),
-                    itemBuilder: (_, i) {
-                      final q = quotes[i];
-                      final isAccepted =
-                          acceptedId != null && acceptedId == q.id;
+class _QuotesList extends ConsumerWidget {
+  final String requestId;
+  final String? acceptedQuoteId;
+  final VoidCallback onQuoteAccepted;
 
-                      final canAccept = acceptedId == null &&
-                          (req.status == 'quoted' || req.status == 'requested');
+  const _QuotesList({required this.requestId, this.acceptedQuoteId, required this.onQuoteAccepted});
 
-                      return Card(
-                        child: Padding(
-                          padding: const EdgeInsets.all(14),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Text(' \$${q.price}',
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .titleLarge
-                                          ?.copyWith(
-                                              fontWeight: FontWeight.w800)),
-                                  const SizedBox(width: 10),
-                                  Container(
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 10, vertical: 6),
-                                    decoration: BoxDecoration(
-                                      color: isAccepted
-                                          ? Colors.green.withOpacity(0.15)
-                                          : Theme.of(context)
-                                              .colorScheme
-                                              .surfaceContainerHighest,
-                                      borderRadius: BorderRadius.circular(999),
-                                    ),
-                                    child: Text(
-                                      isAccepted
-                                          ? 'ACEPTADA'
-                                          : q.status.toUpperCase(),
-                                      style: const TextStyle(
-                                          fontWeight: FontWeight.w800,
-                                          fontSize: 12),
-                                    ),
-                                  ),
-                                  const Spacer(),
-                                  Text('${q.estimatedMinutes} min'),
-                                ],
-                              ),
-                              if ((q.message ?? '').trim().isNotEmpty) ...[
-                                const SizedBox(height: 8),
-                                Text(q.message!,
-                                    style:
-                                        Theme.of(context).textTheme.bodyMedium),
-                              ],
-                              const SizedBox(height: 12),
-                              if (isAccepted)
-                                const Text('Esta cotización ya fue aceptada.',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.w700))
-                              else if (canAccept)
-                                SizedBox(
-                                  width: double.infinity,
-                                  height: 46,
-                                  child: FilledButton.icon(
-                                    icon: const Icon(Icons.check_rounded),
-                                    label: const Text('Aceptar cotización'),
-                                    onPressed: () async {
-                                      final ok = await showDialog<bool>(
-                                        context: context,
-                                        builder: (c) => AlertDialog(
-                                          title:
-                                              const Text('Aceptar cotización'),
-                                          content: const Text(
-                                              '¿Confirmas que deseas aceptar esta cotización?'),
-                                          actions: [
-                                            TextButton(
-                                                onPressed: () =>
-                                                    Navigator.pop(c, false),
-                                                child: const Text('Cancelar')),
-                                            FilledButton(
-                                                onPressed: () =>
-                                                    Navigator.pop(c, true),
-                                                child: const Text('Aceptar')),
-                                          ],
-                                        ),
-                                      );
-                                      if (ok != true) return;
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final repo = ref.watch(supabaseRepoProvider);
+    final cs = Theme.of(context).colorScheme;
 
-                                      try {
-                                        await repo.acceptQuote(q.id);
-                                        if (!mounted) return;
-                                        Navigator.pop(
-                                            ctx); // cerrar bottomsheet
-                                        await _loadAll(); // refrescar detalle
-                                        ScaffoldMessenger.of(context)
-                                            .showSnackBar(const SnackBar(
-                                                content: Text(
-                                                    'Cotización aceptada.')));
-                                      } catch (e) {
-                                        if (!mounted) return;
-                                        ScaffoldMessenger.of(context)
-                                            .showSnackBar(SnackBar(
-                                                content: Text(
-                                                    'No se pudo aceptar: $e')));
-                                      }
-                                    },
-                                  ),
-                                )
-                              else
-                                const Text(
-                                    'No se puede aceptar en este estado.',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.w600)),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-                );
-              },
+    return StreamBuilder<List<Quote>>(
+      stream: repo.streamQuotes(requestId),
+      builder: (context, snapshot) {
+        if (snapshot.hasError) return Text('Error: ${snapshot.error}');
+        if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: LinearProgressIndicator());
+
+        final quotes = snapshot.data ?? [];
+        if (quotes.isEmpty) {
+          return Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.blue.withOpacity(0.05),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: Colors.blue.withOpacity(0.2)),
             ),
-          ),
+            child: Row(
+              children: [
+                const Icon(Icons.info_outline, color: Colors.blue),
+                const SizedBox(width: 12),
+                const Expanded(child: Text('Esperando cotizaciones de técnicos cercanos...')),
+              ],
+            ),
+          );
+        }
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Cotizaciones (${quotes.length})', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+            const SizedBox(height: 10),
+            ...quotes.map((q) => _QuoteCard(
+              quote: q,
+              isAccepted: acceptedQuoteId == q.id,
+              isDisabled: acceptedQuoteId != null && acceptedQuoteId != q.id,
+              onAccept: () => _handleAccept(context, ref, q),
+              onViewProfile: () => context.push('/client/tech/${q.technicianId}'),
+            )),
+          ],
         );
       },
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final repo = ref.watch(supabaseRepoProvider);
-
-    if (_loading) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
-
-    final request = _request;
-    if (request == null) {
-      return Scaffold(
-        appBar: AppBar(title: const Text('Detalle')),
-        body: const Center(child: Text('No se pudo cargar la solicitud.')),
-      );
-    }
-
-    final cs = Theme.of(context).colorScheme;
-    final loc = LatLng(request.lat, request.lng);
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Detalle'),
+  Future<void> _handleAccept(BuildContext context, WidgetRef ref, Quote q) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('¿Aceptar cotización?'),
+        content: Text('Aceptarás la oferta de \$${q.price} y el técnico será notificado para iniciar.'),
         actions: [
-          IconButton(
-            tooltip: 'Refrescar',
-            onPressed: _loadAll,
-            icon: const Icon(Icons.refresh_rounded),
-          ),
-          IconButton(
-            tooltip: 'Editar',
-            onPressed: () => context.go('/client/request/${request.id}/edit'),
-            icon: const Icon(Icons.edit_rounded),
-          ),
-          IconButton(
-            tooltip: 'Eliminar',
-            onPressed: _confirmDelete,
-            icon: Icon(Icons.delete_outline_rounded,
-                color: _canDelete ? null : cs.outline),
-          ),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancelar')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Aceptar Oferta')),
         ],
       ),
-      body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            // ===== Header =====
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
+    );
+
+    if (confirm == true) {
+      try {
+        await ref.read(supabaseRepoProvider).acceptQuote(q.id);
+        onQuoteAccepted();
+      } catch (e) {
+        if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+      }
+    }
+  }
+}
+
+class _QuoteCard extends StatelessWidget {
+  final Quote quote;
+  final bool isAccepted;
+  final bool isDisabled;
+  final VoidCallback onAccept;
+  final VoidCallback onViewProfile;
+
+  const _QuoteCard({
+    required this.quote,
+    required this.isAccepted,
+    required this.isDisabled,
+    required this.onAccept,
+    required this.onViewProfile,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    if (isDisabled) return const SizedBox.shrink(); // Ocultar las rechazadas para limpiar la vista
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        color: isAccepted ? Colors.green[50] : Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: isAccepted ? Border.all(color: Colors.green, width: 2) : Border.all(color: Colors.grey.shade200),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 8, offset: const Offset(0, 4))],
+      ),
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                // Precio
+                Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(request.title,
-                        style: Theme.of(context)
-                            .textTheme
-                            .titleLarge
-                            ?.copyWith(fontWeight: FontWeight.w900)),
-                    const SizedBox(height: 6),
-                    Text(request.description),
-                    const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 10,
-                      runSpacing: 8,
-                      children: [
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 6),
-                          decoration: BoxDecoration(
-                            color: _statusColor(context, request.status),
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Text('Estado: ${_statusLabel(request.status)}',
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.w800, fontSize: 12)),
-                        ),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 6),
-                          decoration: BoxDecoration(
-                            color: cs.surfaceContainerHighest,
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Text(
-                              'Fecha: ${request.createdAt.day.toString().padLeft(2, '0')}/${request.createdAt.month.toString().padLeft(2, '0')} ${request.createdAt.hour.toString().padLeft(2, '0')}:${request.createdAt.minute.toString().padLeft(2, '0')}',
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.w800, fontSize: 12)),
-                        ),
-                      ],
-                    ),
+                    Text('\$${quote.price}', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900, color: cs.primary)),
+                    Text('${quote.estimatedMinutes} min aprox.', style: const TextStyle(fontSize: 12, color: Colors.grey)),
                   ],
+                ),
+                const Spacer(),
+                // Ver Perfil
+                TextButton(
+                  onPressed: onViewProfile,
+                  child: const Text('Ver Técnico'),
+                ),
+              ],
+            ),
+          ),
+          if (quote.message != null && quote.message!.isNotEmpty)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              color: cs.surfaceContainerHighest.withOpacity(0.3),
+              child: Text('"${quote.message}"', style: const TextStyle(fontStyle: FontStyle.italic)),
+            ),
+          
+          if (!isAccepted)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: onAccept,
+                  child: const Text('ACEPTAR Y CONTRATAR'),
                 ),
               ),
             ),
+          
+          if (isAccepted)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(8),
+              color: Colors.green,
+              child: const Text('OFERTA ACEPTADA', textAlign: TextAlign.center, style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, letterSpacing: 1)),
+            ),
+        ],
+      ),
+    );
+  }
+}
 
-            const SizedBox(height: 14),
+class _TimelineSection extends ConsumerWidget {
+  final String requestId;
+  const _TimelineSection({required this.requestId});
 
-            // ===== Ubicación + Mapa =====
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('Ubicación',
-                        style: Theme.of(context)
-                            .textTheme
-                            .titleMedium
-                            ?.copyWith(fontWeight: FontWeight.w900)),
-                    const SizedBox(height: 8),
-                    if ((request.address ?? '').trim().isNotEmpty)
-                      Row(
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final repo = ref.watch(supabaseRepoProvider);
+
+    return StreamBuilder<List<RequestEvent>>(
+      stream: repo.streamRequestEvents(requestId),
+      builder: (context, snapshot) {
+        final events = snapshot.data ?? [];
+        if (events.isEmpty) return const Text('Esperando actividad...', style: TextStyle(color: Colors.grey));
+
+        final sorted = events.reversed.toList();
+
+        return ListView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: sorted.length,
+          itemBuilder: (context, index) {
+            final e = sorted[index];
+            final isLast = index == sorted.length - 1;
+            final date = DateFormat('HH:mm').format(e.createdAt.toLocal());
+
+            return IntrinsicHeight(
+              child: Row(
+                children: [
+                  Column(
+                    children: [
+                      Container(
+                        width: 12, height: 12,
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.primary,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      if (!isLast)
+                        Expanded(child: Container(width: 2, color: Colors.grey[300])),
+                    ],
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.only(bottom: 20),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Icon(Icons.place_rounded, size: 18),
-                          const SizedBox(width: 6),
-                          Expanded(
-                              child: Text(request.address!,
-                                  maxLines: 2,
-                                  overflow: TextOverflow.ellipsis)),
-                        ],
-                      )
-                    else
-                      Row(
-                        children: const [
-                          Icon(Icons.place_rounded, size: 18),
-                          SizedBox(width: 6),
-                          Expanded(
-                              child: Text('Sin dirección (solo coordenadas).')),
-                        ],
-                      ),
-                    const SizedBox(height: 10),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(14),
-                      child: SizedBox(
-                        height: 170,
-                        child: FlutterMap(
-                          options: MapOptions(
-                            initialCenter: loc,
-                            initialZoom: 15,
-                            interactionOptions: const InteractionOptions(
-                                flags: InteractiveFlag.none),
-                          ),
-                          children: [
-                            TileLayer(
-                              urlTemplate:
-                                  'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                              userAgentPackageName: 'com.example.tecnigo',
-                            ),
-                            MarkerLayer(
-                              markers: [
-                                Marker(
-                                  point: loc,
-                                  width: 44,
-                                  height: 44,
-                                  child: Container(
-                                    decoration: BoxDecoration(
-                                      color: cs.primary,
-                                      shape: BoxShape.circle,
-                                      boxShadow: [
-                                        BoxShadow(
-                                            blurRadius: 14,
-                                            color:
-                                                cs.primary.withOpacity(0.25)),
-                                      ],
-                                    ),
-                                    child: Icon(Icons.location_on_rounded,
-                                        color: cs.onPrimary, size: 22),
-                                  ),
-                                )
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 14),
-
-            // ===== Fotos =====
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('Fotos',
-                        style: Theme.of(context)
-                            .textTheme
-                            .titleMedium
-                            ?.copyWith(fontWeight: FontWeight.w900)),
-                    const SizedBox(height: 10),
-                    if (_photos.isEmpty)
-                      const Text('No hay fotos subidas.')
-                    else
-                      SizedBox(
-                        height: 92,
-                        child: ListView.separated(
-                          scrollDirection: Axis.horizontal,
-                          itemCount: _photos.length,
-                          separatorBuilder: (_, __) =>
-                              const SizedBox(width: 10),
-                          itemBuilder: (_, i) {
-                            final p = _photos[i];
-                            final url = repo.publicUrl(_bucket, p.path);
-                            return GestureDetector(
-                              onTap: () => _openPhoto(url),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(12),
-                                child: CachedNetworkImage(
-                                  imageUrl: url,
-                                  width: 120,
-                                  height: 92,
-                                  fit: BoxFit.cover,
-                                  placeholder: (_, __) => Container(
-                                    width: 120,
-                                    height: 92,
-                                    color: cs.surfaceContainerHighest,
-                                    alignment: Alignment.center,
-                                    child: const SizedBox(
-                                        width: 18,
-                                        height: 18,
-                                        child: CircularProgressIndicator(
-                                            strokeWidth: 2)),
-                                  ),
-                                  errorWidget: (_, __, ___) => Container(
-                                    width: 120,
-                                    height: 92,
-                                    color: cs.surfaceContainerHighest,
-                                    alignment: Alignment.center,
-                                    child:
-                                        const Icon(Icons.broken_image_outlined),
-                                  ),
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 14),
-
-            // ✅ ===== Flujo / Estados (REGRESÓ) =====
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('Flujo / Estados',
-                        style: Theme.of(context)
-                            .textTheme
-                            .titleMedium
-                            ?.copyWith(fontWeight: FontWeight.w900)),
-                    const SizedBox(height: 10),
-                    StreamBuilder<List<RequestEvent>>(
-                      stream: repo.streamRequestEvents(widget.requestId),
-                      builder: (context, snap) {
-                        final events = snap.data ?? const <RequestEvent>[];
-                        if (snap.connectionState == ConnectionState.waiting) {
-                          return const Padding(
-                            padding: EdgeInsets.symmetric(vertical: 14),
-                            child: Center(child: CircularProgressIndicator()),
-                          );
-                        }
-                        if (events.isEmpty) {
-                          return const Text('Aún no hay eventos registrados.');
-                        }
-
-                        // Mostramos del más reciente al más antiguo
-                        final list = events.reversed.toList();
-
-                        return Column(
-                          children: list.map((e) {
-                            final time =
-                                '${e.createdAt.hour.toString().padLeft(2, '0')}:${e.createdAt.minute.toString().padLeft(2, '0')}';
-                            return Padding(
-                              padding: const EdgeInsets.only(bottom: 10),
-                              child: Row(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Icon(Icons.show_chart_rounded,
-                                      color: cs.primary),
-                                  const SizedBox(width: 10),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Row(
-                                          children: [
-                                            Expanded(
-                                              child: Text(
-                                                _statusLabel(e.status),
-                                                style: const TextStyle(
-                                                    fontWeight:
-                                                        FontWeight.w900),
-                                              ),
-                                            ),
-                                            Text(time,
-                                                style: TextStyle(
-                                                    color: cs.outline)),
-                                          ],
-                                        ),
-                                        if ((e.note ?? '').trim().isNotEmpty)
-                                          Padding(
-                                            padding:
-                                                const EdgeInsets.only(top: 2),
-                                            child: Text(e.note!,
-                                                style: TextStyle(
-                                                    color:
-                                                        cs.onSurfaceVariant)),
-                                          ),
-                                      ],
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            );
-                          }).toList(),
-                        );
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 14),
-
-            // ✅ ===== Cotizaciones (BOTÓN) =====
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('Cotizaciones',
-                        style: Theme.of(context)
-                            .textTheme
-                            .titleMedium
-                            ?.copyWith(fontWeight: FontWeight.w900)),
-                    const SizedBox(height: 10),
-                    StreamBuilder<List<Quote>>(
-                      stream: repo.streamQuotes(widget.requestId),
-                      builder: (context, snap) {
-                        final quotes = snap.data ?? const <Quote>[];
-                        final count = quotes.length;
-
-                        return Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text('Recibidas: $count'),
-                            const SizedBox(height: 10),
-                            SizedBox(
-                              width: double.infinity,
-                              height: 46,
-                              child: FilledButton.icon(
-                                onPressed: () =>
-                                    _openQuotesBottomSheet(request),
-                                icon: const Icon(Icons.receipt_long_rounded),
-                                label: Text(count == 0
-                                    ? 'Ver cotizaciones'
-                                    : 'Ver cotizaciones ($count)'),
-                              ),
-                            ),
-                            if (request.acceptedQuoteId != null) ...[
-                              const SizedBox(height: 10),
-                              const Text('✅ Ya aceptaste una cotización.',
-                                  style:
-                                      TextStyle(fontWeight: FontWeight.w800)),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(_mapStatus(e.status), style: const TextStyle(fontWeight: FontWeight.bold)),
+                              Text(date, style: const TextStyle(color: Colors.grey, fontSize: 12)),
                             ],
-                          ],
-                        );
-                      },
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 14),
-
-// ✅ ===== Calificar técnico =====
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Calificación',
-                      style: Theme.of(context)
-                          .textTheme
-                          .titleMedium
-                          ?.copyWith(fontWeight: FontWeight.w900),
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      _canReview
-                          ? 'El servicio fue completado. Ya puedes calificar al técnico.'
-                          : 'La calificación se habilita cuando el técnico complete el servicio.',
-                    ),
-                    const SizedBox(height: 12),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 46,
-                      child: FilledButton.icon(
-                        onPressed: _canReview
-                            ? () => context
-                                .go('/client/request/${request.id}/review')
-                            : null,
-                        icon: const Icon(Icons.star_rate_rounded),
-                        label: const Text('Calificar técnico'),
+                          ),
+                        ],
                       ),
                     ),
-                  ],
-                ),
+                  )
+                ],
               ),
-            ),
-          ],
-        ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  String _mapStatus(String s) {
+    switch(s) {
+      case 'requested': return 'Solicitud creada';
+      case 'quoted': return 'Nueva cotización recibida';
+      case 'accepted': return 'Has aceptado una cotización';
+      case 'on_the_way': return 'El técnico va en camino';
+      case 'in_progress': return 'El trabajo ha comenzado';
+      case 'completed': return 'Trabajo finalizado';
+      case 'rated': return 'Calificación enviada';
+      default: return s;
+    }
+  }
+}
+
+class _StatusBadgeLarge extends StatelessWidget {
+  final String status;
+  const _StatusBadgeLarge({required this.status});
+
+  @override
+  Widget build(BuildContext context) {
+    Color color;
+    String label;
+    IconData icon;
+
+    switch (status) {
+      case 'requested':
+        color = Colors.orange; label = 'Buscando Técnicos'; icon = Icons.search; break;
+      case 'quoted':
+        color = Colors.blue; label = 'Tienes Cotizaciones'; icon = Icons.notifications_active; break;
+      case 'accepted':
+        color = Colors.purple; label = 'Técnico Asignado'; icon = Icons.check; break;
+      case 'on_the_way':
+        color = Colors.purple; label = 'Técnico en Camino'; icon = Icons.directions_car; break;
+      case 'in_progress':
+        color = Colors.purple; label = 'Trabajo en Curso'; icon = Icons.handyman; break;
+      case 'completed':
+        color = Colors.green; label = 'Trabajo Completado'; icon = Icons.check_circle; break;
+      case 'rated':
+        color = Colors.grey; label = 'Finalizado'; icon = Icons.done_all; break;
+      default:
+        color = Colors.grey; label = status; icon = Icons.info;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(30),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Column(
+        children: [
+          Icon(icon, color: color, size: 30),
+          const SizedBox(height: 4),
+          Text(label, style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 16)),
+        ],
       ),
     );
   }
